@@ -1,6 +1,17 @@
-# 💸 Share Bill - Chia Bill Nhóm
+# 🤝 Lên Kèo — Lên kế hoạch & chia tiền nhóm
 
-Ứng dụng web đơn giản để chia bill cho nhóm bạn. Chủ nhóm tạo bill, thêm thành viên, chia sẻ link/QR. Thành viên chuyển khoản và upload ảnh xác nhận.
+> **Plan together, split the bill.**
+
+Ứng dụng web để **lên kế hoạch mua đồ** và **chia bill** cho nhóm bạn.
+
+Luồng mới (plan-first):
+1. **Tạo nhóm** chỉ với tên nhóm + tên chủ nhóm — chưa cần giá tiền.
+2. Mọi người vào nhóm bằng mã/link, **chat** để bàn mua gì.
+3. Khi chốt, chủ nhóm bấm **“Lên giá & chia bill”** để nhập số tiền từng người + QR/tài khoản.
+4. Thành viên xem bill và bấm **“Done”** — **không bắt buộc up ảnh** chứng minh.
+5. Chủ nhóm xác nhận từng người (hoặc đánh dấu tiền mặt).
+
+> 💬 Mỗi nhóm có **group chat riêng**, chỉ tồn tại trong nhóm đó.
 
 ## 🛠 Công nghệ
 
@@ -15,7 +26,7 @@
 ### Bước 1: Cài dependencies
 
 ```bash
-cd share-bill
+cd LenKeo
 npm install
 ```
 
@@ -25,7 +36,8 @@ npm install
 2. Tạo project mới (hoặc dùng project có sẵn)
 3. Vào **SQL Editor** → bấm **New Query**
 4. Copy toàn bộ nội dung file `supabase-setup.sql` → paste vào → bấm **Run**
-5. Kiểm tra tab **Table Editor** → phải thấy 2 bảng: `groups` và `members`
+   - Nếu bạn **đã tạo schema cũ** từ trước, chạy `supabase-migration.sql` thay vì setup (an toàn khi chạy nhiều lần).
+5. Kiểm tra tab **Table Editor** → phải thấy 3 bảng: `groups`, `members`, `messages`
 
 ### Bước 3: Lấy Supabase credentials
 
@@ -73,32 +85,33 @@ Mở trình duyệt tại `http://localhost:5173`
 ## 📖 Cách sử dụng
 
 ### Chủ nhóm
-1. Bấm **Tạo nhóm mới**
-2. Nhập tên nhóm, tên chủ nhóm, tổng số tiền
-3. Thêm thành viên (tên + số tiền). Có nút **Chia đều** tự động
-4. Upload ảnh QR chuyển khoản hoặc nhập thông tin tài khoản ngân hàng
-5. Bấm **Tạo nhóm** → nhận được mã nhóm + QR code để chia sẻ
-6. Theo dõi trạng thái thanh toán trên Dashboard
-7. Xác nhận khi thành viên đã chuyển khoản, hoặc bấm **Tiền mặt** nếu nhận tiền mặt
-8. Đóng / Xóa nhóm khi hoàn tất
+1. Bấm **Tạo nhóm mới** → nhập tên nhóm + tên của bạn → **Tạo nhóm**
+2. Chia sẻ **mã nhóm / link / QR** để mọi người vào
+3. Tab **Chat**: cùng nhau bàn mua gì, lên kế hoạch
+4. Khi chốt → tab **Lên giá**: nhập tên + số tiền từng người (nút **Chia đều** tiện lợi), thêm QR/tài khoản ngân hàng → **Chốt giá & mở bill**
+5. Theo dõi trạng thái ở tab **Bill**; **Xác nhận** khi ai đó báo đóng, hoặc **Tiền mặt** nếu nhận tiền mặt
+6. Có thể **➕ Thêm người** vào bill bất cứ lúc nào
+7. **Đóng / Xóa** nhóm khi hoàn tất
 
 ### Thành viên
 1. Bấm **Vào nhóm** → nhập mã nhóm (hoặc mở link được chia sẻ)
-2. Chọn tên của mình trong danh sách
-3. Xem QR / thông tin tài khoản chủ nhóm → chuyển khoản
-4. Upload ảnh chuyển khoản → bấm **Done**
-5. Chờ chủ nhóm xác nhận
+2. Nhập **tên của bạn** để tham gia & chat
+3. Tab **Chat**: bàn kế hoạch cùng nhóm
+4. Khi chủ nhóm đã lên giá → tab **Bill** → chọn tên của bạn → xem QR/tài khoản
+5. Chuyển khoản rồi bấm **Done** (up ảnh là **tùy chọn**, không bắt buộc)
+6. Chờ chủ nhóm xác nhận
 
 ---
 
 ## 📁 Cấu trúc project
 
 ```
-share-bill/
+LenKeo/
 ├── index.html              # Entry HTML
 ├── package.json
 ├── vite.config.js
-├── supabase-setup.sql      # SQL tạo database
+├── supabase-setup.sql      # SQL tạo database (project mới)
+├── supabase-migration.sql  # SQL migrate database cũ
 ├── .env.example             # File mẫu biến môi trường
 ├── public/
 │   └── vite.svg             # Favicon
@@ -107,12 +120,15 @@ share-bill/
     ├── App.jsx              # Router
     ├── index.css            # Toàn bộ CSS (dark theme)
     ├── lib/
-    │   └── supabase.js      # Supabase client
+    │   ├── supabase.js      # Supabase client
+    │   └── identity.js      # Tên hiển thị lưu localStorage theo nhóm
+    ├── components/
+    │   └── Chat.jsx         # Group chat realtime (dùng chung)
     └── pages/
         ├── Home.jsx         # Trang chủ
-        ├── CreateGroup.jsx  # Tạo nhóm (3 bước)
-        ├── GroupOwner.jsx   # Dashboard chủ nhóm
-        └── GroupMember.jsx  # Giao diện thành viên
+        ├── CreateGroup.jsx  # Tạo nhóm (tên + chủ nhóm)
+        ├── GroupOwner.jsx   # Chủ nhóm: Chat + Lên giá + theo dõi bill
+        └── GroupMember.jsx  # Thành viên: Chat + đóng bill (Done)
 ```
 
 ---

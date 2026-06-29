@@ -45,9 +45,11 @@ export default function Home() {
   return (
     <div className="container">
       <div className="logo">
-        <span className="logo-icon">💸</span>
-        <h1 className="page-title">Share Bill</h1>
-        <p className="page-subtitle">Chia bill dễ dàng cho nhóm bạn</p>
+        <span className="logo-icon">🤝</span>
+        <h1 className="page-title">Lên Kèo</h1>
+        <p className="page-subtitle">Rủ cả nhóm lên kế hoạch & chia tiền<br />
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Plan together, split the bill</span>
+        </p>
       </div>
 
       <div className="home-actions animate-slide-up">
