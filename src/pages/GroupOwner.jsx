@@ -3,31 +3,36 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { QRCodeSVG } from 'qrcode.react'
 import { supabase } from '../lib/supabase'
 import { getName } from '../lib/identity'
+import { computeBill, groupSharesByItem, formatVnd, dueInfo } from '../lib/bills'
 import Chat from '../components/Chat'
+import BillEditor from '../components/BillEditor'
+import { DueBadge, ShareBadge } from '../components/BillCard'
 
 export default function GroupOwner() {
   const { groupId } = useParams()
   const navigate = useNavigate()
+
   const [group, setGroup] = useState(null)
-  const [members, setMembers] = useState([])
+  const [participants, setParticipants] = useState([])
+  const [bills, setBills] = useState([])
+  const [items, setItems] = useState([])
+  const [itemShares, setItemShares] = useState([])
+  const [billShares, setBillShares] = useState([])
+
   const [loading, setLoading] = useState(true)
   const [toast, setToast] = useState(null)
   const [proofModal, setProofModal] = useState(null)
   const [tab, setTab] = useState('chat')
 
-  // Bill creation form (planning phase)
-  const [billMembers, setBillMembers] = useState([{ name: '', amount: '' }])
-  const [billTotal, setBillTotal] = useState('')
+  // Bills view: { mode: 'list' | 'create' | 'edit' | 'detail', billId }
+  const [view, setView] = useState({ mode: 'list' })
+
+  // Account / QR editor
+  const [editAccount, setEditAccount] = useState(false)
   const [bankName, setBankName] = useState('')
   const [accountNumber, setAccountNumber] = useState('')
   const [accountHolder, setAccountHolder] = useState('')
   const [qrImage, setQrImage] = useState('')
-  const [chatNames, setChatNames] = useState([])
-  const [creating, setCreating] = useState(false)
-  const [billError, setBillError] = useState('')
-
-  // Add-member-to-active-bill inline form
-  const [newMember, setNewMember] = useState({ name: '', amount: '' })
 
   const ownerName = group?.owner_name || getName(groupId) || 'Chủ nhóm'
 
@@ -37,219 +42,203 @@ export default function GroupOwner() {
   }
 
   const fetchData = useCallback(async () => {
-    if (!supabase) {
-      setLoading(false)
-      return
-    }
+    if (!supabase) { setLoading(false); return }
 
-    const { data: g } = await supabase
-      .from('groups')
-      .select('*')
-      .eq('id', groupId)
-      .single()
-
-    if (!g) {
-      navigate('/')
-      return
-    }
+    const { data: g } = await supabase.from('groups').select('*').eq('id', groupId).single()
+    if (!g) { navigate('/'); return }
     setGroup(g)
 
-    const { data: m } = await supabase
-      .from('members')
-      .select('*')
-      .eq('group_id', groupId)
-      .order('created_at', { ascending: true })
-
-    setMembers(m || [])
+    const [pRes, bRes, iRes, isRes, bsRes] = await Promise.all([
+      supabase.from('participants').select('*').eq('group_id', groupId).order('created_at'),
+      supabase.from('bills').select('*').eq('group_id', groupId).order('bill_date', { ascending: false }).order('created_at', { ascending: false }),
+      supabase.from('bill_items').select('*').eq('group_id', groupId),
+      supabase.from('item_shares').select('*').eq('group_id', groupId),
+      supabase.from('bill_shares').select('*').eq('group_id', groupId),
+    ])
+    setParticipants(pRes.data || [])
+    setBills(bRes.data || [])
+    setItems(iRes.data || [])
+    setItemShares(isRes.data || [])
+    setBillShares(bsRes.data || [])
     setLoading(false)
   }, [groupId, navigate])
 
-  // Distinct chat participants — handy to prefill the bill
-  const fetchChatNames = useCallback(async () => {
-    if (!supabase) return
-    const { data } = await supabase
-      .from('messages')
-      .select('sender_name, is_owner')
-      .eq('group_id', groupId)
-    const names = [...new Set((data || []).filter(d => !d.is_owner).map(d => d.sender_name.trim()))]
-    setChatNames(names)
-  }, [groupId])
-
   useEffect(() => {
     fetchData()
-    fetchChatNames()
-
     if (!supabase) return
-
-    const channel = supabase
-      .channel(`group-${groupId}`)
-      .on('postgres_changes', {
-        event: '*', schema: 'public', table: 'members', filter: `group_id=eq.${groupId}`
-      }, () => fetchData())
-      .subscribe()
-
+    const channel = supabase.channel(`owner-${groupId}`)
+    for (const table of ['participants', 'bills', 'bill_items', 'item_shares', 'bill_shares', 'groups']) {
+      channel.on('postgres_changes',
+        { event: '*', schema: 'public', table, filter: table === 'groups' ? `id=eq.${groupId}` : `group_id=eq.${groupId}` },
+        () => fetchData())
+    }
+    channel.subscribe()
     return () => { supabase.removeChannel(channel) }
-  }, [groupId, fetchData, fetchChatNames])
+  }, [groupId, fetchData])
 
-  // ----- Bill form helpers -----
-  const addBillRow = () => {
-    if (billMembers.length >= 30) return
-    setBillMembers([...billMembers, { name: '', amount: '' }])
+  // ----- Derived per-bill data -----
+  const sharesByItem = groupSharesByItem(itemShares)
+  const itemsOf = (billId) => items.filter(it => it.bill_id === billId)
+  const sharesOf = (billId) => billShares.filter(s => s.bill_id === billId)
+  const computeFor = (billId) => computeBill(itemsOf(billId), sharesByItem)
+  const participantName = (id) => participants.find(p => p.id === id)?.name || '?'
+
+  // ----- Participants -----
+  const addParticipant = async (name) => {
+    const n = name.trim()
+    if (!n) return
+    if (participants.some(p => p.name.trim().toLowerCase() === n.toLowerCase())) {
+      showToast('Người này đã có trong danh sách', 'error'); return
+    }
+    const { error } = await supabase.from('participants').insert({ group_id: groupId, name: n })
+    if (error) { showToast('Lỗi khi thêm người', 'error'); return }
+    await fetchData()
   }
-  const removeBillRow = (idx) => {
-    if (billMembers.length <= 1) return
-    setBillMembers(billMembers.filter((_, i) => i !== idx))
+  const removeParticipant = async (id) => {
+    if (!window.confirm('Xoá người này khỏi nhóm? Phần chia của họ trong các hoá đơn sẽ bị xoá.')) return
+    await supabase.from('participants').delete().eq('id', id)
+    showToast('Đã xoá người')
+    fetchData()
   }
-  const updateBillRow = (idx, field, value) => {
-    const updated = [...billMembers]
-    updated[idx][field] = value
-    setBillMembers(updated)
-  }
-  const addNameFromChat = (name) => {
-    if (billMembers.some(m => m.name.trim().toLowerCase() === name.toLowerCase())) return
-    const empties = billMembers.filter(m => !m.name.trim())
-    if (empties.length > 0) {
-      const idx = billMembers.findIndex(m => !m.name.trim())
-      updateBillRow(idx, 'name', name)
-    } else {
-      setBillMembers([...billMembers, { name, amount: '' }])
+
+  // ----- Bill write helpers -----
+  const writeItems = async (billId, payloadItems) => {
+    for (const it of payloadItems) {
+      const { data: itemRow, error } = await supabase.from('bill_items')
+        .insert({ group_id: groupId, bill_id: billId, name: it.name, price: it.price, qty: it.qty, note: it.note })
+        .select().single()
+      if (error) throw error
+      if (it.assignedIds.length) {
+        const { error: sErr } = await supabase.from('item_shares')
+          .insert(it.assignedIds.map(pid => ({ group_id: groupId, item_id: itemRow.id, participant_id: pid })))
+        if (sErr) throw sErr
+      }
     }
   }
-  const splitEvenly = () => {
-    if (!billTotal) return
-    const valid = billMembers.filter(m => m.name.trim())
-    if (valid.length === 0) return
-    const per = Math.ceil(Number(billTotal) / valid.length)
-    setBillMembers(billMembers.map(m => ({ ...m, amount: m.name.trim() ? String(per) : m.amount })))
+
+  const owedFromPayload = (payloadItems) => {
+    const owed = {}
+    for (const it of payloadItems) {
+      const lt = (Number(it.price) || 0) * (Number(it.qty) || 1)
+      if (!it.assignedIds.length) continue
+      const per = lt / it.assignedIds.length
+      for (const pid of it.assignedIds) owed[pid] = (owed[pid] || 0) + per
+    }
+    return owed
+  }
+
+  const syncBillShares = async (billId, owed) => {
+    const owingIds = Object.keys(owed)
+    const { data: existing } = await supabase.from('bill_shares').select('*').eq('bill_id', billId)
+    const existingIds = new Set((existing || []).map(s => s.participant_id))
+    const toInsert = owingIds.filter(pid => !existingIds.has(pid))
+      .map(pid => ({ group_id: groupId, bill_id: billId, participant_id: pid, status: 'pending', payment_method: 'none' }))
+    if (toInsert.length) await supabase.from('bill_shares').insert(toInsert)
+    const toDelete = (existing || []).filter(s => !owingIds.includes(s.participant_id)).map(s => s.id)
+    if (toDelete.length) await supabase.from('bill_shares').delete().in('id', toDelete)
+  }
+
+  const createBill = async (payload) => {
+    const { data: bill, error } = await supabase.from('bills')
+      .insert({ group_id: groupId, title: payload.title, bill_date: payload.billDate, due_date: payload.dueDate, note: payload.note, status: 'open' })
+      .select().single()
+    if (error) throw error
+    await writeItems(bill.id, payload.items)
+    await syncBillShares(bill.id, owedFromPayload(payload.items))
+    if (group.status === 'planning') await supabase.from('groups').update({ status: 'active' }).eq('id', groupId)
+    showToast('Đã tạo hoá đơn 🎉')
+    setView({ mode: 'detail', billId: bill.id })
+    fetchData()
+  }
+
+  const updateBill = async (billId, payload) => {
+    const { error } = await supabase.from('bills')
+      .update({ title: payload.title, bill_date: payload.billDate, due_date: payload.dueDate, note: payload.note })
+      .eq('id', billId)
+    if (error) throw error
+    await supabase.from('bill_items').delete().eq('bill_id', billId) // cascades item_shares
+    await writeItems(billId, payload.items)
+    await syncBillShares(billId, owedFromPayload(payload.items))
+    showToast('Đã lưu thay đổi ✓')
+    setView({ mode: 'detail', billId })
+    fetchData()
+  }
+
+  // ----- Bill / share actions -----
+  const confirmShare = async (shareId) => {
+    await supabase.from('bill_shares').update({ status: 'confirmed' }).eq('id', shareId)
+    showToast('Đã xác nhận ✓'); fetchData()
+  }
+  const markCashShare = async (shareId) => {
+    await supabase.from('bill_shares').update({ status: 'confirmed', payment_method: 'cash' }).eq('id', shareId)
+    showToast('Đã ghi nhận tiền mặt 💵'); fetchData()
+  }
+  const unconfirmShare = async (shareId) => {
+    await supabase.from('bill_shares').update({ status: 'pending', payment_method: 'none' }).eq('id', shareId)
+    showToast('Đã huỷ xác nhận'); fetchData()
+  }
+  const closeBill = async (billId) => {
+    await supabase.from('bills').update({ status: 'closed' }).eq('id', billId)
+    showToast('Đã đóng hoá đơn'); fetchData()
+  }
+  const reopenBill = async (billId) => {
+    await supabase.from('bills').update({ status: 'open' }).eq('id', billId)
+    showToast('Đã mở lại hoá đơn'); fetchData()
+  }
+  const deleteBill = async (billId) => {
+    if (!window.confirm('Xoá hoá đơn này? Không thể hoàn tác.')) return
+    await supabase.from('bills').delete().eq('id', billId) // cascades items/shares
+    showToast('Đã xoá hoá đơn')
+    setView({ mode: 'list' }); fetchData()
+  }
+
+  // ----- Account / QR -----
+  const startEditAccount = () => {
+    setBankName(group.bank_name || '')
+    setAccountNumber(group.account_number || '')
+    setAccountHolder(group.account_holder || '')
+    setQrImage(group.qr_image || '')
+    setEditAccount(true)
   }
   const handleQrUpload = (e) => {
     const file = e.target.files[0]
     if (!file) return
-    if (file.size > 2 * 1024 * 1024) {
-      setBillError('Ảnh QR không được vượt quá 2MB')
-      return
-    }
+    if (file.size > 2 * 1024 * 1024) { showToast('Ảnh QR tối đa 2MB', 'error'); return }
     const reader = new FileReader()
     reader.onload = (ev) => setQrImage(ev.target.result)
     reader.readAsDataURL(file)
   }
-
-  const createBill = async () => {
-    setBillError('')
-    const valid = billMembers.filter(m => m.name.trim() && m.amount)
-    if (valid.length === 0) {
-      setBillError('Cần ít nhất 1 người và số tiền')
-      return
-    }
-    if (!bankName && !accountNumber && !qrImage) {
-      setBillError('Nhập thông tin ngân hàng hoặc upload QR để mọi người chuyển khoản')
-      return
-    }
-
-    setCreating(true)
-    try {
-      const total = valid.reduce((s, m) => s + Number(m.amount), 0)
-
-      const { error: gErr } = await supabase
-        .from('groups')
-        .update({
-          total_amount: total,
-          bank_name: bankName.trim() || null,
-          account_number: accountNumber.trim() || null,
-          account_holder: accountHolder.trim() || null,
-          qr_image: qrImage || null,
-          status: 'active',
-        })
-        .eq('id', groupId)
-      if (gErr) throw gErr
-
-      const inserts = valid.map(m => ({
-        group_id: groupId,
-        name: m.name.trim(),
-        amount: Number(m.amount),
-        payment_method: 'none',
-        status: 'pending',
-      }))
-      const { error: mErr } = await supabase.from('members').insert(inserts)
-      if (mErr) throw mErr
-
-      showToast('Đã lên giá & chia bill 🎉')
-      setTab('bill')
-      fetchData()
-    } catch (err) {
-      setBillError(err.message || 'Có lỗi xảy ra')
-    }
-    setCreating(false)
-  }
-
-  const addMemberToActiveBill = async () => {
-    if (!newMember.name.trim() || !newMember.amount) return
-    const { error } = await supabase.from('members').insert({
-      group_id: groupId,
-      name: newMember.name.trim(),
-      amount: Number(newMember.amount),
-      payment_method: 'none',
-      status: 'pending',
-    })
-    if (error) { showToast('Lỗi khi thêm người', 'error'); return }
-    await supabase.from('groups')
-      .update({ total_amount: Number(group.total_amount) + Number(newMember.amount) })
-      .eq('id', groupId)
-    setNewMember({ name: '', amount: '' })
-    showToast('Đã thêm người vào bill')
+  const saveAccount = async () => {
+    await supabase.from('groups').update({
+      bank_name: bankName.trim() || null,
+      account_number: accountNumber.trim() || null,
+      account_holder: accountHolder.trim() || null,
+      qr_image: qrImage || null,
+    }).eq('id', groupId)
+    setEditAccount(false)
+    showToast('Đã lưu thông tin chuyển khoản')
     fetchData()
   }
 
-  // ----- Payment actions -----
-  const confirmPayment = async (memberId) => {
-    await supabase.from('members').update({ status: 'confirmed' }).eq('id', memberId)
-    showToast('Đã xác nhận thanh toán ✓')
-    fetchData()
-  }
-  const markCash = async (memberId) => {
-    await supabase.from('members')
-      .update({ status: 'confirmed', payment_method: 'cash' }).eq('id', memberId)
-    showToast('Đã ghi nhận tiền mặt 💵')
-    fetchData()
-  }
+  // ----- Room actions -----
   const closeGroup = async () => {
-    if (!window.confirm('Bạn có chắc muốn đóng nhóm? Thành viên sẽ không thể submit thêm.')) return
+    if (!window.confirm('Đóng nhóm? Thành viên sẽ không đóng tiền được nữa.')) return
     await supabase.from('groups').update({ status: 'closed' }).eq('id', groupId)
-    showToast('Đã đóng nhóm')
-    fetchData()
+    showToast('Đã đóng nhóm'); fetchData()
   }
   const reopenGroup = async () => {
     await supabase.from('groups').update({ status: 'active' }).eq('id', groupId)
-    showToast('Đã mở lại nhóm')
-    fetchData()
+    showToast('Đã mở lại nhóm'); fetchData()
   }
   const deleteGroup = async () => {
     if (!window.confirm('Xóa nhóm vĩnh viễn? Hành động này không thể hoàn tác.')) return
     await supabase.from('messages').delete().eq('group_id', groupId)
-    await supabase.from('members').delete().eq('group_id', groupId)
-    await supabase.from('groups').delete().eq('id', groupId)
+    await supabase.from('groups').delete().eq('id', groupId) // cascades all bill tables
     navigate('/')
   }
 
-  const copyLink = () => {
-    navigator.clipboard.writeText(`${window.location.origin}/group/${groupId}`)
-    showToast('Đã copy link! 📋')
-  }
-  const copyCode = () => {
-    navigator.clipboard.writeText(group.group_code)
-    showToast('Đã copy mã nhóm! 📋')
-  }
-
-  const formatNumber = (num) => Number(num).toLocaleString('vi-VN')
-
-  const getStatusBadge = (member) => {
-    if (member.status === 'confirmed' && member.payment_method === 'cash') {
-      return <span className="badge badge-cash">💵 Tiền mặt</span>
-    }
-    if (member.status === 'confirmed') return <span className="badge badge-confirmed">✓ Đã xác nhận</span>
-    if (member.status === 'submitted') return <span className="badge badge-submitted">📤 Chờ xác nhận</span>
-    return <span className="badge badge-pending">⏳ Chưa đóng</span>
-  }
+  const copyLink = () => { navigator.clipboard.writeText(`${window.location.origin}/group/${groupId}`); showToast('Đã copy link! 📋') }
+  const copyCode = () => { navigator.clipboard.writeText(group.group_code); showToast('Đã copy mã nhóm! 📋') }
 
   if (loading) {
     return (
@@ -260,14 +249,187 @@ export default function GroupOwner() {
     )
   }
 
-  const isPlanning = group.status === 'planning'
-  const confirmed = members.filter(m => m.status === 'confirmed').length
-  const submitted = members.filter(m => m.status === 'submitted').length
-  const pending = members.filter(m => m.status === 'pending').length
-  const paidAmount = members.filter(m => m.status === 'confirmed').reduce((s, m) => s + Number(m.amount), 0)
-  const progress = members.length > 0 ? Math.round((confirmed / members.length) * 100) : 0
   const shareLink = `${window.location.origin}/group/${groupId}`
-  const billTotalSum = billMembers.reduce((s, m) => s + (Number(m.amount) || 0), 0)
+  const totalSubmitted = billShares.filter(s => s.status === 'submitted').length
+  const hasAccount = group.bank_name || group.account_number || group.qr_image
+
+  // chat-derived names not yet participants (quick suggestions handled in editor via add)
+
+  // ---------- Bill detail renderer ----------
+  const renderDetail = (bill) => {
+    const { owed, total, unassigned } = computeFor(bill.id)
+    const shares = sharesOf(bill.id)
+    const shareByPid = Object.fromEntries(shares.map(s => [s.participant_id, s]))
+    const confirmedAmt = shares.filter(s => s.status === 'confirmed').reduce((sum, s) => sum + (owed[s.participant_id] || 0), 0)
+    const confirmedCount = shares.filter(s => s.status === 'confirmed').length
+    const billItems = itemsOf(bill.id)
+    const di = dueInfo(bill.due_date)
+    const allSettled = shares.length > 0 && confirmedCount === shares.length
+
+    return (
+      <div className="animate-slide-up">
+        <button className="back-btn" onClick={() => setView({ mode: 'list' })}>← Danh sách hoá đơn</button>
+
+        <div className="bill-detail-head">
+          <h2 style={{ marginBottom: 4 }}>{bill.title}</h2>
+          <div className="bill-meta">
+            {bill.bill_date && <span>📅 {new Date(`${bill.bill_date}T00:00:00`).toLocaleDateString('vi-VN')}</span>}
+            <DueBadge dueDate={bill.due_date} settled={allSettled} />
+            {bill.status === 'closed' && <span className="badge badge-cash">🔒 Đã đóng</span>}
+          </div>
+          {bill.note && <p className="page-subtitle" style={{ textAlign: 'left', marginTop: 6 }}>{bill.note}</p>}
+          {di && di.overdue && !allSettled && (
+            <div className="status-banner closed" style={{ marginTop: 10 }}>⚠️ Hoá đơn đã {di.label.toLowerCase()}</div>
+          )}
+        </div>
+
+        <div className="progress-bar-wrapper">
+          <div className="progress-bar-label">
+            <span>Đã đóng {confirmedCount}/{shares.length}</span>
+            <span>{formatVnd(confirmedAmt)} / {formatVnd(total)}đ</span>
+          </div>
+          <div className="progress-bar">
+            <div className="progress-bar-fill" style={{ width: `${total > 0 ? Math.round((confirmedAmt / total) * 100) : 0}%` }}></div>
+          </div>
+        </div>
+
+        {/* Items breakdown */}
+        <div className="card" style={{ marginBottom: 16 }}>
+          <h3 className="section-title" style={{ fontSize: '0.95rem', marginBottom: 10 }}>🍽️ Chi tiết món</h3>
+          {billItems.map(it => {
+            const sharers = sharesByItem[it.id] || []
+            return (
+              <div key={it.id} className="detail-item-row">
+                <div>
+                  <div className="detail-item-name">{it.name} {Number(it.qty) > 1 && <span className="detail-item-qty">×{Number(it.qty)}</span>}</div>
+                  <div className="detail-item-sub">
+                    {sharers.length ? sharers.map(participantName).join(', ') : <span style={{ color: 'var(--warning)' }}>chưa gán ai</span>}
+                  </div>
+                </div>
+                <div className="detail-item-price">{formatVnd(Number(it.price) * Number(it.qty))}đ</div>
+              </div>
+            )
+          })}
+          {unassigned > 0 && (
+            <div className="detail-item-row">
+              <div className="detail-item-name" style={{ color: 'var(--warning)' }}>Chưa gán cho ai</div>
+              <div className="detail-item-price" style={{ color: 'var(--warning)' }}>{formatVnd(unassigned)}đ</div>
+            </div>
+          )}
+        </div>
+
+        {/* Per-person */}
+        <h3 className="section-title" style={{ margin: '4px 0 8px' }}>👥 Ai trả bao nhiêu</h3>
+        {shares.length === 0 && <div className="empty-state"><p>Chưa gán món cho ai. Bấm “Sửa” để gán.</p></div>}
+        {shares.map(s => {
+          const amt = owed[s.participant_id] || 0
+          return (
+            <div key={s.id} className="member-card">
+              <div className="member-avatar">{participantName(s.participant_id).charAt(0).toUpperCase()}</div>
+              <div className="member-info">
+                <div className="member-name">{participantName(s.participant_id)}</div>
+                <div className="member-amount">{formatVnd(amt)}đ</div>
+                <div style={{ marginTop: 4 }}><ShareBadge share={s} /></div>
+              </div>
+              <div className="member-actions">
+                {s.status === 'submitted' && s.payment_proof && (
+                  <button className="btn btn-sm btn-secondary" onClick={() => setProofModal({ ...s, name: participantName(s.participant_id) })}>🖼️ Ảnh</button>
+                )}
+                {s.status !== 'confirmed' && (
+                  <button className="btn btn-sm btn-success" onClick={() => confirmShare(s.id)}>✓ Xác nhận</button>
+                )}
+                {s.status === 'pending' && (
+                  <button className="btn btn-sm btn-warning" onClick={() => markCashShare(s.id)}>💵 Tiền mặt</button>
+                )}
+                {s.status === 'confirmed' && (
+                  <button className="btn btn-sm btn-secondary" onClick={() => unconfirmShare(s.id)}>↩︎ Huỷ</button>
+                )}
+              </div>
+            </div>
+          )
+        })}
+
+        <div className="divider"></div>
+        <div className="action-row">
+          <button className="btn btn-secondary" onClick={() => setView({ mode: 'edit', billId: bill.id })}>✏️ Sửa</button>
+          {bill.status === 'open'
+            ? <button className="btn btn-warning" onClick={() => closeBill(bill.id)}>🔒 Đóng</button>
+            : <button className="btn btn-success" onClick={() => reopenBill(bill.id)}>🔓 Mở lại</button>}
+          <button className="btn btn-danger" onClick={() => deleteBill(bill.id)}>🗑️ Xoá</button>
+        </div>
+      </div>
+    )
+  }
+
+  // ---------- Bills list ----------
+  const renderBillsList = () => (
+    <div className="animate-slide-up">
+      {/* Roster */}
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3 className="section-title" style={{ fontSize: '0.95rem', marginBottom: 10 }}>👥 Người trong nhóm ({participants.length})</h3>
+        {participants.length === 0 ? (
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>
+            Chưa có ai. Khi tạo hoá đơn bạn có thể thêm người và gán món cho họ.
+          </p>
+        ) : (
+          <div className="roster-chips">
+            {participants.map(p => (
+              <span key={p.id} className="roster-chip">
+                {p.name}
+                <button onClick={() => removeParticipant(p.id)} title="Xoá">✕</button>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <button className="btn btn-primary btn-block btn-lg" style={{ marginBottom: 16 }}
+        onClick={() => setView({ mode: 'create' })} disabled={group.status === 'closed'}>
+        ＋ Tạo hoá đơn mới
+      </button>
+
+      {bills.length === 0 ? (
+        <div className="empty-state">
+          <span className="empty-state-icon">🧾</span>
+          <p>Chưa có hoá đơn nào. Bàn bạc trong <strong>Chat</strong> rồi tạo hoá đơn khi chốt!</p>
+        </div>
+      ) : (
+        bills.map(bill => {
+          const { total } = computeFor(bill.id)
+          const shares = sharesOf(bill.id)
+          const confirmedCount = shares.filter(s => s.status === 'confirmed').length
+          const allSettled = shares.length > 0 && confirmedCount === shares.length
+          return (
+            <div key={bill.id} className="bill-list-card" onClick={() => setView({ mode: 'detail', billId: bill.id })}>
+              <div className="bill-list-top">
+                <div className="bill-list-title">{bill.title}</div>
+                <div className="bill-list-total">{formatVnd(total)}đ</div>
+              </div>
+              <div className="bill-meta">
+                {bill.bill_date && <span>📅 {new Date(`${bill.bill_date}T00:00:00`).toLocaleDateString('vi-VN')}</span>}
+                <DueBadge dueDate={bill.due_date} settled={allSettled} />
+                {bill.status === 'closed' && <span className="badge badge-cash">🔒 Đã đóng</span>}
+              </div>
+              <div className="bill-list-progress">
+                {allSettled
+                  ? <span style={{ color: 'var(--success)' }}>✓ Mọi người đã đóng</span>
+                  : <span>Đã đóng {confirmedCount}/{shares.length} người</span>}
+              </div>
+            </div>
+          )
+        })
+      )}
+    </div>
+  )
+
+  const currentBill = view.billId ? bills.find(b => b.id === view.billId) : null
+  const editorInitial = view.mode === 'edit' && currentBill ? {
+    ...currentBill,
+    items: itemsOf(currentBill.id).map(it => ({
+      id: it.id, name: it.name, price: it.price, qty: it.qty, note: it.note,
+      assignedIds: sharesByItem[it.id] || [],
+    })),
+  } : null
 
   return (
     <div className="container">
@@ -279,8 +441,8 @@ export default function GroupOwner() {
       </div>
 
       <div className={`status-banner ${group.status}`}>
-        {group.status === 'planning' && '📝 Đang lên kế hoạch — chưa chia bill'}
-        {group.status === 'active' && '🟢 Bill đang mở — chờ mọi người đóng'}
+        {group.status === 'planning' && '📝 Đang lên kế hoạch · chưa có hoá đơn'}
+        {group.status === 'active' && '🟢 Nhóm đang mở'}
         {group.status === 'closed' && '🔴 Nhóm đã đóng'}
       </div>
 
@@ -296,234 +458,102 @@ export default function GroupOwner() {
 
       {/* Tabs */}
       <div className="tabs">
-        <button className={`tab ${tab === 'chat' ? 'active' : ''}`} onClick={() => setTab('chat')}>
-          💬 Chat
-        </button>
+        <button className={`tab ${tab === 'chat' ? 'active' : ''}`} onClick={() => setTab('chat')}>💬 Chat</button>
         <button className={`tab ${tab === 'bill' ? 'active' : ''}`} onClick={() => setTab('bill')}>
-          🧾 {isPlanning ? 'Lên giá' : 'Bill'}
-          {submitted > 0 && <span className="tab-badge">{submitted}</span>}
+          🧾 Hoá đơn{bills.length > 0 && <span className="tab-badge" style={{ background: 'var(--accent-gradient)' }}>{bills.length}</span>}
+          {totalSubmitted > 0 && <span className="tab-badge">{totalSubmitted}</span>}
         </button>
+        <button className={`tab ${tab === 'account' ? 'active' : ''}`} onClick={() => setTab('account')}>💳 TK</button>
       </div>
 
-      {/* ---------- CHAT TAB ---------- */}
-      {tab === 'chat' && (
-        <Chat groupId={groupId} senderName={ownerName} isOwner={true} />
-      )}
+      {tab === 'chat' && <Chat groupId={groupId} senderName={ownerName} isOwner={true} />}
 
-      {/* ---------- BILL TAB ---------- */}
-      {tab === 'bill' && isPlanning && (
-        <div className="animate-slide-up">
-          <div className="card" style={{ marginBottom: 16 }}>
-            <h3 className="section-title" style={{ marginBottom: 6 }}>🧾 Lên giá &amp; chia bill</h3>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: 16 }}>
-              Nhập tên + số tiền mỗi người cần đóng. Khi xong, mọi người sẽ thấy bill và bấm “Done”.
-            </p>
-
-            {chatNames.length > 0 && (
-              <div style={{ marginBottom: 16 }}>
-                <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', marginBottom: 8 }}>
-                  👥 Thêm nhanh từ chat:
-                </p>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                  {chatNames.map(n => (
-                    <button key={n} className="copy-btn" onClick={() => addNameFromChat(n)}>
-                      + {n}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="section-header">
-              <h3 className="section-title" style={{ fontSize: '0.95rem' }}>
-                Thành viên ({billMembers.length}/30)
-              </h3>
-              <button className="btn btn-sm btn-secondary" onClick={splitEvenly} disabled={!billTotal}>
-                ⚡ Chia đều
-              </button>
-            </div>
-
-            <div className="form-group">
-              <label className="form-label">Tổng tiền (để chia đều — tùy chọn)</label>
-              <input
-                type="number"
-                className="form-input"
-                placeholder="VD: 1500000"
-                value={billTotal}
-                onChange={e => setBillTotal(e.target.value)}
-              />
-            </div>
-
-            {billMembers.map((m, idx) => (
-              <div key={idx} className="member-form-row">
-                <input
-                  type="text" className="form-input"
-                  placeholder={`Tên người ${idx + 1}`}
-                  value={m.name}
-                  onChange={e => updateBillRow(idx, 'name', e.target.value)}
-                />
-                <input
-                  type="number" className="form-input"
-                  placeholder="Số tiền"
-                  value={m.amount}
-                  onChange={e => updateBillRow(idx, 'amount', e.target.value)}
-                />
-                {billMembers.length > 1 && (
-                  <button className="remove-member-btn" onClick={() => removeBillRow(idx)} title="Xóa">✕</button>
-                )}
-              </div>
-            ))}
-
-            {billMembers.length < 30 && (
-              <button className="btn btn-secondary btn-block btn-sm" onClick={addBillRow} style={{ marginTop: 8 }}>
-                + Thêm người
-              </button>
-            )}
-
-            <div style={{ textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: 16 }}>
-              Tổng bill: <strong style={{ color: 'var(--accent-start)' }}>{formatNumber(billTotalSum)} VNĐ</strong>
-            </div>
-          </div>
-
-          {/* Bank info */}
-          <div className="card" style={{ marginBottom: 16 }}>
-            <h3 className="section-title" style={{ marginBottom: 16 }}>📱 QR chuyển khoản</h3>
-            <div className={`upload-area ${qrImage ? 'has-image' : ''}`} onClick={() => document.getElementById('qr-upload').click()}>
-              {qrImage ? (
-                <img src={qrImage} alt="QR Bank" className="upload-preview" />
-              ) : (
-                <>
-                  <span className="upload-icon">📷</span>
-                  <p className="upload-text"><span>Bấm để upload</span> ảnh QR chuyển khoản</p>
-                </>
-              )}
-            </div>
-            <input id="qr-upload" type="file" className="upload-input" accept="image/*" onChange={handleQrUpload} />
-            {qrImage && (
-              <button className="btn btn-secondary btn-sm btn-block" style={{ marginTop: 8 }} onClick={() => setQrImage('')}>
-                🗑️ Xóa ảnh QR
-              </button>
-            )}
-
-            <h3 className="section-title" style={{ margin: '20px 0 16px' }}>🏦 Thông tin tài khoản</h3>
-            <div className="form-group">
-              <label className="form-label">Tên ngân hàng</label>
-              <input type="text" className="form-input" placeholder="VD: Vietcombank, MBBank..." value={bankName} onChange={e => setBankName(e.target.value)} />
-            </div>
-            <div className="form-group">
-              <label className="form-label">Số tài khoản</label>
-              <input type="text" className="form-input" placeholder="VD: 1234567890" value={accountNumber} onChange={e => setAccountNumber(e.target.value)} />
-            </div>
-            <div className="form-group" style={{ marginBottom: 0 }}>
-              <label className="form-label">Tên chủ tài khoản</label>
-              <input type="text" className="form-input" placeholder="VD: NGUYEN VAN A" value={accountHolder} onChange={e => setAccountHolder(e.target.value)} />
-            </div>
-          </div>
-
-          {billError && (
-            <div style={{
-              background: 'var(--danger-bg)', border: '1px solid rgba(248,113,113,0.3)',
-              borderRadius: 'var(--radius-md)', padding: '12px 16px', marginBottom: 16,
-              color: 'var(--danger)', fontSize: '0.9rem', textAlign: 'center'
-            }}>{billError}</div>
+      {tab === 'bill' && (
+        <>
+          {view.mode === 'list' && renderBillsList()}
+          {view.mode === 'create' && (
+            <BillEditor participants={participants} onSave={createBill}
+              onCancel={() => setView({ mode: 'list' })} onAddParticipant={addParticipant} />
           )}
-
-          <button className="btn btn-primary btn-block btn-lg" onClick={createBill} disabled={creating} id="btn-create-bill">
-            {creating ? <span className="spinner"></span> : '💸 Chốt giá & mở bill'}
-          </button>
-        </div>
+          {view.mode === 'edit' && currentBill && (
+            <BillEditor participants={participants} initial={editorInitial}
+              onSave={(p) => updateBill(currentBill.id, p)}
+              onCancel={() => setView({ mode: 'detail', billId: currentBill.id })} onAddParticipant={addParticipant} />
+          )}
+          {view.mode === 'detail' && currentBill && renderDetail(currentBill)}
+          {view.mode === 'detail' && !currentBill && renderBillsList()}
+        </>
       )}
 
-      {/* ---------- BILL TAB (active/closed) ---------- */}
-      {tab === 'bill' && !isPlanning && (
+      {/* Account tab */}
+      {tab === 'account' && (
         <div className="animate-slide-up">
-          <div className="stats-row">
-            <div className="stat-card">
-              <div className="stat-value success">{confirmed}</div>
-              <div className="stat-label">Đã đóng</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-value warning">{submitted}</div>
-              <div className="stat-label">Chờ duyệt</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-value info">{pending}</div>
-              <div className="stat-label">Chưa đóng</div>
-            </div>
-          </div>
+          {!editAccount ? (
+            <>
+              {group.qr_image && (
+                <div className="card" style={{ textAlign: 'center', marginBottom: 16 }}>
+                  <h3 className="section-title" style={{ marginBottom: 12 }}>📱 QR chuyển khoản</h3>
+                  <img src={group.qr_image} alt="QR" className="qr-bank-image" />
+                </div>
+              )}
+              {(group.bank_name || group.account_number) ? (
+                <div className="bank-info" style={{ marginBottom: 16 }}>
+                  {group.bank_name && <div className="bank-info-row"><span className="bank-info-label">Ngân hàng</span><span className="bank-info-value">{group.bank_name}</span></div>}
+                  {group.account_number && <div className="bank-info-row"><span className="bank-info-label">Số tài khoản</span><span className="bank-info-value">{group.account_number}</span></div>}
+                  {group.account_holder && <div className="bank-info-row"><span className="bank-info-label">Chủ tài khoản</span><span className="bank-info-value">{group.account_holder}</span></div>}
+                </div>
+              ) : (
+                <div className="empty-state"><span className="empty-state-icon">💳</span><p>Chưa có thông tin chuyển khoản. Thêm để mọi người chuyển tiền.</p></div>
+              )}
+              <button className="btn btn-primary btn-block" onClick={startEditAccount}>
+                {hasAccount ? '✏️ Sửa thông tin chuyển khoản' : '＋ Thêm thông tin chuyển khoản'}
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="card" style={{ marginBottom: 16 }}>
+                <h3 className="section-title" style={{ marginBottom: 16 }}>📱 QR chuyển khoản</h3>
+                <div className={`upload-area ${qrImage ? 'has-image' : ''}`} onClick={() => document.getElementById('qr-upload').click()}>
+                  {qrImage ? <img src={qrImage} alt="QR" className="upload-preview" /> : (
+                    <><span className="upload-icon">📷</span><p className="upload-text"><span>Bấm để upload</span> ảnh QR</p></>
+                  )}
+                </div>
+                <input id="qr-upload" type="file" className="upload-input" accept="image/*" onChange={handleQrUpload} />
+                {qrImage && <button className="btn btn-secondary btn-sm btn-block" style={{ marginTop: 8 }} onClick={() => setQrImage('')}>🗑️ Xóa ảnh QR</button>}
 
-          <div className="progress-bar-wrapper">
-            <div className="progress-bar-label">
-              <span>Tiến độ: {confirmed}/{members.length}</span>
-              <span>{formatNumber(paidAmount)} / {formatNumber(group.total_amount)} VNĐ</span>
-            </div>
-            <div className="progress-bar">
-              <div className="progress-bar-fill" style={{ width: `${progress}%` }}></div>
-            </div>
-          </div>
-
-          <div className="section-header" style={{ marginTop: 8 }}>
-            <h3 className="section-title">👥 Thành viên ({members.length})</h3>
-          </div>
-
-          {members.map((member) => (
-            <div key={member.id} className="member-card">
-              <div className="member-avatar">{member.name.charAt(0).toUpperCase()}</div>
-              <div className="member-info">
-                <div className="member-name">{member.name}</div>
-                <div className="member-amount">{formatNumber(member.amount)} VNĐ</div>
-                <div style={{ marginTop: 4 }}>{getStatusBadge(member)}</div>
+                <h3 className="section-title" style={{ margin: '20px 0 16px' }}>🏦 Tài khoản</h3>
+                <div className="form-group"><label className="form-label">Tên ngân hàng</label>
+                  <input type="text" className="form-input" placeholder="VD: Vietcombank" value={bankName} onChange={e => setBankName(e.target.value)} /></div>
+                <div className="form-group"><label className="form-label">Số tài khoản</label>
+                  <input type="text" className="form-input" placeholder="VD: 1234567890" value={accountNumber} onChange={e => setAccountNumber(e.target.value)} /></div>
+                <div className="form-group" style={{ marginBottom: 0 }}><label className="form-label">Tên chủ tài khoản</label>
+                  <input type="text" className="form-input" placeholder="VD: NGUYEN VAN A" value={accountHolder} onChange={e => setAccountHolder(e.target.value)} /></div>
               </div>
-              <div className="member-actions">
-                {member.status === 'submitted' && member.payment_proof && (
-                  <button className="btn btn-sm btn-secondary" onClick={() => setProofModal(member)}>🖼️ Xem ảnh</button>
-                )}
-                {member.status === 'submitted' && (
-                  <button className="btn btn-sm btn-success" onClick={() => confirmPayment(member.id)}>✓ Xác nhận</button>
-                )}
-                {member.status === 'pending' && group.status === 'active' && (
-                  <button className="btn btn-sm btn-warning" onClick={() => markCash(member.id)}>💵 Tiền mặt</button>
-                )}
+              <div className="action-row">
+                <button className="btn btn-secondary" onClick={() => setEditAccount(false)}>Huỷ</button>
+                <button className="btn btn-primary" onClick={saveAccount}>💾 Lưu</button>
               </div>
-            </div>
-          ))}
-
-          {/* Add person to active bill */}
-          {group.status === 'active' && (
-            <div className="card" style={{ marginTop: 12 }}>
-              <h3 className="section-title" style={{ fontSize: '0.9rem', marginBottom: 12 }}>➕ Thêm người vào bill</h3>
-              <div className="member-form-row" style={{ marginBottom: 0 }}>
-                <input type="text" className="form-input" placeholder="Tên" value={newMember.name}
-                  onChange={e => setNewMember({ ...newMember, name: e.target.value })} />
-                <input type="number" className="form-input" placeholder="Số tiền" value={newMember.amount}
-                  onChange={e => setNewMember({ ...newMember, amount: e.target.value })} />
-                <button className="btn btn-sm btn-primary" style={{ alignSelf: 'flex-end', height: 44 }}
-                  onClick={addMemberToActiveBill} disabled={!newMember.name.trim() || !newMember.amount}>＋</button>
-              </div>
-            </div>
+            </>
           )}
 
           <div className="divider"></div>
-
           <div className="action-row">
-            {group.status === 'active' ? (
-              <button className="btn btn-danger" onClick={closeGroup}>🔒 Đóng nhóm</button>
-            ) : (
-              <button className="btn btn-success" onClick={reopenGroup}>🔓 Mở lại</button>
-            )}
+            {group.status !== 'closed'
+              ? <button className="btn btn-danger" onClick={closeGroup}>🔒 Đóng nhóm</button>
+              : <button className="btn btn-success" onClick={reopenGroup}>🔓 Mở lại nhóm</button>}
             <button className="btn btn-danger" onClick={deleteGroup}>🗑️ Xóa nhóm</button>
           </div>
         </div>
       )}
 
-      {/* Proof Modal */}
+      {/* Proof modal */}
       {proofModal && (
         <div className="modal-overlay" onClick={() => setProofModal(null)}>
           <div className="modal-content" onClick={e => e.stopPropagation()}>
             <h3 style={{ marginBottom: 16 }}>Ảnh chuyển khoản - {proofModal.name}</h3>
             <img src={proofModal.payment_proof} alt="Payment proof" />
             <div className="action-row" style={{ marginTop: 16 }}>
-              <button className="btn btn-success" onClick={() => { confirmPayment(proofModal.id); setProofModal(null) }}>✓ Xác nhận</button>
+              <button className="btn btn-success" onClick={() => { confirmShare(proofModal.id); setProofModal(null) }}>✓ Xác nhận</button>
               <button className="btn btn-secondary" onClick={() => setProofModal(null)}>Đóng</button>
             </div>
           </div>

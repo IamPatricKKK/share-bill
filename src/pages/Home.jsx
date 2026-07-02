@@ -59,8 +59,11 @@ export default function Home() {
           id="btn-create-group"
         >
           <span className="home-action-icon">🆕</span>
-          <h3 className="home-action-title">Tạo nhóm mới</h3>
-          <p className="home-action-desc">Tạo bill và mời bạn bè chia tiền</p>
+          <div className="home-action-text">
+            <h3 className="home-action-title">Tạo nhóm mới</h3>
+            <p className="home-action-desc">Tạo bill và mời bạn bè chia tiền</p>
+          </div>
+          <span className="home-action-arrow">→</span>
         </div>
 
         <div
@@ -69,8 +72,11 @@ export default function Home() {
           id="btn-join-group"
         >
           <span className="home-action-icon">🔗</span>
-          <h3 className="home-action-title">Vào nhóm</h3>
-          <p className="home-action-desc">Nhập mã nhóm để tham gia chia bill</p>
+          <div className="home-action-text">
+            <h3 className="home-action-title">Vào nhóm</h3>
+            <p className="home-action-desc">Nhập mã nhóm để tham gia chia bill</p>
+          </div>
+          <span className="home-action-arrow">→</span>
         </div>
       </div>
 

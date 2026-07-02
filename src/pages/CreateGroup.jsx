@@ -66,7 +66,7 @@ export default function CreateGroup() {
       <button className="back-btn" onClick={() => navigate('/')}>← Trang chủ</button>
 
       <h1 className="page-title">Tạo nhóm mới</h1>
-      <p className="page-subtitle">Tạo nhóm để bàn kế hoạch — giá tiền lên sau</p>
+      <p className="page-subtitle">Tạo nhóm để bàn kế hoạch, giá tiền lên sau</p>
 
       {error && (
         <div style={{
@@ -121,7 +121,8 @@ export default function CreateGroup() {
           lineHeight: 1.5,
         }}>
           💬 Sau khi tạo, nhóm sẽ có <strong>khung chat</strong> để cả nhóm bàn mua gì.
-          Khi chốt, bạn bấm <strong>“Lên giá &amp; chia bill”</strong> để nhập số tiền cho từng người.
+          Khi chốt, bạn tạo <strong>hoá đơn</strong>: nhập từng món, giá, ngày &amp; hạn trả,
+          rồi gán món cho từng người để tự chia tiền.
         </div>
 
         <button

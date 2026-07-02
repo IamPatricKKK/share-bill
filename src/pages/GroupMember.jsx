@@ -1,27 +1,33 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
-import { getName, setName } from '../lib/identity'
+import { getName, setName, getParticipantId, setParticipantId } from '../lib/identity'
+import { computeBill, groupSharesByItem, formatVnd, dueInfo } from '../lib/bills'
 import Chat from '../components/Chat'
+import { DueBadge, ShareBadge } from '../components/BillCard'
 
 export default function GroupMember() {
   const { groupId } = useParams()
   const navigate = useNavigate()
+
   const [group, setGroup] = useState(null)
-  const [members, setMembers] = useState([])
+  const [participants, setParticipants] = useState([])
+  const [bills, setBills] = useState([])
+  const [items, setItems] = useState([])
+  const [itemShares, setItemShares] = useState([])
+  const [billShares, setBillShares] = useState([])
+
   const [loading, setLoading] = useState(true)
   const [toast, setToast] = useState(null)
   const [tab, setTab] = useState('chat')
 
-  // Identity
   const [myName, setMyName] = useState(getName(groupId))
   const [nameInput, setNameInput] = useState('')
+  const [myPid, setMyPid] = useState(getParticipantId(groupId))
 
-  // Bill sub-flow
-  const [selectedMember, setSelectedMember] = useState(null)
+  const [openBillId, setOpenBillId] = useState(null)
   const [paymentProof, setPaymentProof] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  const [billStep, setBillStep] = useState('select') // select | pay | done
 
   const showToast = (message, type = 'success') => {
     setToast({ message, type })
@@ -29,98 +35,81 @@ export default function GroupMember() {
   }
 
   const fetchData = useCallback(async () => {
-    if (!supabase) {
-      setLoading(false)
-      return
-    }
-
+    if (!supabase) { setLoading(false); return }
     const { data: g } = await supabase.from('groups').select('*').eq('id', groupId).single()
-    if (!g) {
-      navigate('/')
-      return
-    }
+    if (!g) { navigate('/'); return }
     setGroup(g)
 
-    const { data: m } = await supabase
-      .from('members')
-      .select('*')
-      .eq('group_id', groupId)
-      .order('created_at', { ascending: true })
-    setMembers(m || [])
+    const [pRes, bRes, iRes, isRes, bsRes] = await Promise.all([
+      supabase.from('participants').select('*').eq('group_id', groupId).order('created_at'),
+      supabase.from('bills').select('*').eq('group_id', groupId).order('bill_date', { ascending: false }).order('created_at', { ascending: false }),
+      supabase.from('bill_items').select('*').eq('group_id', groupId),
+      supabase.from('item_shares').select('*').eq('group_id', groupId),
+      supabase.from('bill_shares').select('*').eq('group_id', groupId),
+    ])
+    setParticipants(pRes.data || [])
+    setBills(bRes.data || [])
+    setItems(iRes.data || [])
+    setItemShares(isRes.data || [])
+    setBillShares(bsRes.data || [])
     setLoading(false)
   }, [groupId, navigate])
 
   useEffect(() => {
     fetchData()
     if (!supabase) return
-
-    const channel = supabase
-      .channel(`member-${groupId}`)
-      .on('postgres_changes', {
-        event: '*', schema: 'public', table: 'members', filter: `group_id=eq.${groupId}`
-      }, () => fetchData())
-      .subscribe()
-
+    const channel = supabase.channel(`member-${groupId}`)
+    for (const table of ['participants', 'bills', 'bill_items', 'item_shares', 'bill_shares', 'groups']) {
+      channel.on('postgres_changes',
+        { event: '*', schema: 'public', table, filter: table === 'groups' ? `id=eq.${groupId}` : `group_id=eq.${groupId}` },
+        () => fetchData())
+    }
+    channel.subscribe()
     return () => { supabase.removeChannel(channel) }
   }, [groupId, fetchData])
+
+  // Auto-link to a participant whose name matches mine (once roster loads).
+  useEffect(() => {
+    if (myPid || !myName || participants.length === 0) return
+    const match = participants.find(p => p.name.trim().toLowerCase() === myName.trim().toLowerCase())
+    if (match) { setParticipantId(groupId, match.id); setMyPid(match.id) }
+  }, [participants, myName, myPid, groupId])
 
   const saveName = (e) => {
     e.preventDefault()
     const n = nameInput.trim()
     if (!n) return
-    setName(groupId, n)
-    setMyName(n)
+    setName(groupId, n); setMyName(n)
   }
+  const pickParticipant = (id) => { setParticipantId(groupId, id); setMyPid(id) }
 
   const handleImageUpload = (e) => {
     const file = e.target.files[0]
     if (!file) return
-    if (file.size > 2 * 1024 * 1024) {
-      showToast('Ảnh không được vượt quá 2MB', 'error')
-      return
-    }
+    if (file.size > 2 * 1024 * 1024) { showToast('Ảnh tối đa 2MB', 'error'); return }
     const reader = new FileReader()
     reader.onload = (ev) => setPaymentProof(ev.target.result)
     reader.readAsDataURL(file)
   }
 
-  // Done — proof is OPTIONAL
-  const submitPayment = async () => {
+  // ----- Derived -----
+  const sharesByItem = groupSharesByItem(itemShares)
+  const itemsOf = (billId) => items.filter(it => it.bill_id === billId)
+  const sharesOf = (billId) => billShares.filter(s => s.bill_id === billId)
+  const computeFor = (billId) => computeBill(itemsOf(billId), sharesByItem)
+  const participantName = (id) => participants.find(p => p.id === id)?.name || '?'
+  const myShareFor = (billId) => billShares.find(s => s.bill_id === billId && s.participant_id === myPid)
+
+  const submitPayment = async (share) => {
     setSubmitting(true)
-    const { error } = await supabase
-      .from('members')
-      .update({
-        payment_proof: paymentProof || null,
-        payment_method: 'transfer',
-        status: 'submitted',
-      })
-      .eq('id', selectedMember.id)
-
-    if (error) {
-      showToast('Có lỗi xảy ra, thử lại', 'error')
-    } else {
-      showToast('Đã báo xong! Chờ chủ nhóm xác nhận ⏳')
-      setBillStep('done')
-      fetchData()
-    }
+    const { error } = await supabase.from('bill_shares').update({
+      payment_proof: paymentProof || null,
+      payment_method: 'transfer',
+      status: 'submitted',
+    }).eq('id', share.id)
+    if (error) showToast('Có lỗi, thử lại', 'error')
+    else { showToast('Đã báo xong! Chờ chủ nhóm xác nhận ⏳'); setPaymentProof('') }
     setSubmitting(false)
-  }
-
-  const selectMember = (member) => {
-    if (member.status === 'confirmed') return
-    setSelectedMember(member)
-    setBillStep(member.status === 'submitted' ? 'done' : 'pay')
-  }
-
-  const formatNumber = (num) => Number(num).toLocaleString('vi-VN')
-
-  const getStatusBadge = (member) => {
-    if (member.status === 'confirmed' && member.payment_method === 'cash') {
-      return <span className="badge badge-cash">💵 Tiền mặt</span>
-    }
-    if (member.status === 'confirmed') return <span className="badge badge-confirmed">✓ Đã xác nhận</span>
-    if (member.status === 'submitted') return <span className="badge badge-submitted">📤 Chờ xác nhận</span>
-    return <span className="badge badge-pending">⏳ Chưa đóng</span>
   }
 
   if (loading) {
@@ -131,7 +120,6 @@ export default function GroupMember() {
       </div>
     )
   }
-
   if (!group) return null
 
   // ----- Name gate -----
@@ -145,19 +133,10 @@ export default function GroupMember() {
           <p className="page-subtitle">Nhập tên của bạn để tham gia nhóm &amp; chat</p>
           <form className="card" onSubmit={saveName}>
             <div className="form-group" style={{ marginBottom: 16 }}>
-              <input
-                type="text"
-                className="form-input"
-                placeholder="Tên của bạn (VD: Lan)"
-                value={nameInput}
-                onChange={e => setNameInput(e.target.value)}
-                maxLength={40}
-                autoFocus
-              />
+              <input type="text" className="form-input" placeholder="Tên của bạn (VD: Lan)"
+                value={nameInput} onChange={e => setNameInput(e.target.value)} maxLength={40} autoFocus />
             </div>
-            <button type="submit" className="btn btn-primary btn-block" disabled={!nameInput.trim()}>
-              Vào nhóm →
-            </button>
+            <button type="submit" className="btn btn-primary btn-block" disabled={!nameInput.trim()}>Vào nhóm →</button>
           </form>
         </div>
         {toast && <div className={`toast show ${toast.type}`}>{toast.message}</div>}
@@ -165,112 +144,123 @@ export default function GroupMember() {
     )
   }
 
-  const isPlanning = group.status === 'planning'
-  const confirmed = members.filter(m => m.status === 'confirmed').length
-  const progress = members.length > 0 ? Math.round((confirmed / members.length) * 100) : 0
+  const canPay = (bill) => group.status === 'active' && bill.status === 'open'
 
-  // ----- Payment sub-views (overlay the bill tab) -----
-  const renderPayView = () => {
-    const current = members.find(m => m.id === selectedMember.id) || selectedMember
+  // ----- Bill detail (member) -----
+  const renderBillDetail = (bill) => {
+    const { owed, total } = computeFor(bill.id)
+    const shares = sharesOf(bill.id)
+    const myShare = myShareFor(bill.id)
+    const myAmount = myPid ? owed[myPid] || 0 : 0
+    const billItems = itemsOf(bill.id)
+    const di = dueInfo(bill.due_date)
 
-    if (billStep === 'done') {
-      return (
-        <div className="animate-fade-in" style={{ textAlign: 'center', padding: '24px 0' }}>
-          {current.status === 'confirmed' ? (
-            <>
-              <span style={{ fontSize: '4rem', display: 'block', marginBottom: 16 }}>🎉</span>
-              <h2 style={{ marginBottom: 8 }}>Đã được xác nhận!</h2>
-              <p style={{ color: 'var(--text-secondary)' }}>Chủ nhóm đã xác nhận thanh toán của bạn</p>
-            </>
-          ) : (
-            <>
-              <span style={{ fontSize: '4rem', display: 'block', marginBottom: 16, animation: 'pulse 2s infinite' }}>⏳</span>
-              <h2 style={{ marginBottom: 8 }}>Đang chờ xác nhận</h2>
-              <p style={{ color: 'var(--text-secondary)' }}>
-                Đã báo xong, chờ chủ nhóm ({group.owner_name}) xác nhận
-              </p>
-            </>
-          )}
-          <div className="card" style={{ textAlign: 'left', marginTop: 24 }}>
-            <div className="bank-info-row"><span className="bank-info-label">Người đóng</span><span className="bank-info-value">{current.name}</span></div>
-            <div className="bank-info-row"><span className="bank-info-label">Số tiền</span><span className="bank-info-value">{formatNumber(current.amount)} VNĐ</span></div>
-            <div className="bank-info-row"><span className="bank-info-label">Trạng thái</span>{getStatusBadge(current)}</div>
-          </div>
-          <button className="btn btn-secondary btn-block" style={{ marginTop: 16 }}
-            onClick={() => { setBillStep('select'); setSelectedMember(null); setPaymentProof('') }}>
-            ← Quay lại danh sách
-          </button>
-        </div>
-      )
-    }
-
-    // billStep === 'pay'
     return (
-      <div className="animate-fade-in">
-        <button className="back-btn" onClick={() => { setBillStep('select'); setSelectedMember(null); setPaymentProof('') }}>
-          ← Chọn người khác
-        </button>
-        <h2 style={{ marginBottom: 4 }}>{current.name}</h2>
-        <p className="page-subtitle" style={{ marginBottom: 20, textAlign: 'left' }}>
-          Cần đóng: <strong style={{ color: 'var(--accent-start)' }}>{formatNumber(current.amount)} VNĐ</strong>
-        </p>
+      <div className="animate-slide-up">
+        <button className="back-btn" onClick={() => { setOpenBillId(null); setPaymentProof('') }}>← Danh sách hoá đơn</button>
+        <h2 style={{ marginBottom: 4 }}>{bill.title}</h2>
+        <div className="bill-meta" style={{ marginBottom: 8 }}>
+          {bill.bill_date && <span>📅 {new Date(`${bill.bill_date}T00:00:00`).toLocaleDateString('vi-VN')}</span>}
+          <DueBadge dueDate={bill.due_date} settled={myShare?.status === 'confirmed'} />
+          {bill.status === 'closed' && <span className="badge badge-cash">🔒 Đã đóng</span>}
+        </div>
+        {bill.note && <p className="page-subtitle" style={{ textAlign: 'left', marginBottom: 12 }}>{bill.note}</p>}
 
-        {group.qr_image && (
-          <div className="card" style={{ textAlign: 'center', marginBottom: 16 }}>
-            <h3 className="section-title" style={{ marginBottom: 12 }}>📱 QR chuyển khoản</h3>
-            <img src={group.qr_image} alt="QR Bank" className="qr-bank-image" />
+        {/* My share highlight */}
+        {myPid && myShare ? (
+          <div className="my-share-box">
+            <div className="my-share-label">Bạn ({participantName(myPid)}) cần đóng</div>
+            <div className="my-share-amount">{formatVnd(myAmount)}đ</div>
+            <div style={{ marginTop: 6 }}><ShareBadge share={myShare} /></div>
+            {di && di.overdue && myShare.status !== 'confirmed' && (
+              <div style={{ color: 'var(--danger)', fontSize: '0.82rem', marginTop: 6 }}>⚠️ {di.label}</div>
+            )}
           </div>
-        )}
+        ) : myPid ? (
+          <div className="empty-state" style={{ padding: '16px 0' }}><p>Bạn không có phần trong hoá đơn này.</p></div>
+        ) : null}
 
-        {(group.bank_name || group.account_number) && (
-          <div className="bank-info" style={{ marginBottom: 16 }}>
-            <h3 className="section-title" style={{ marginBottom: 12, padding: '0 4px' }}>🏦 Thông tin tài khoản</h3>
-            {group.bank_name && <div className="bank-info-row"><span className="bank-info-label">Ngân hàng</span><span className="bank-info-value">{group.bank_name}</span></div>}
-            {group.account_number && <div className="bank-info-row"><span className="bank-info-label">Số tài khoản</span><span className="bank-info-value">{group.account_number}</span></div>}
-            {group.account_holder && <div className="bank-info-row"><span className="bank-info-label">Chủ tài khoản</span><span className="bank-info-value">{group.account_holder}</span></div>}
-            <div className="bank-info-row">
-              <span className="bank-info-label">Số tiền</span>
-              <span className="bank-info-value" style={{ color: 'var(--accent-start)', fontSize: '1.1rem' }}>{formatNumber(current.amount)} VNĐ</span>
-            </div>
-          </div>
-        )}
-
-        {group.status === 'active' ? (
+        {/* Pay box */}
+        {myPid && myShare && myShare.status !== 'confirmed' && canPay(bill) && (
           <>
+            {group.qr_image && (
+              <div className="card" style={{ textAlign: 'center', marginBottom: 16 }}>
+                <h3 className="section-title" style={{ marginBottom: 12 }}>📱 QR chuyển khoản</h3>
+                <img src={group.qr_image} alt="QR" className="qr-bank-image" />
+              </div>
+            )}
+            {(group.bank_name || group.account_number) && (
+              <div className="bank-info" style={{ marginBottom: 16 }}>
+                {group.bank_name && <div className="bank-info-row"><span className="bank-info-label">Ngân hàng</span><span className="bank-info-value">{group.bank_name}</span></div>}
+                {group.account_number && <div className="bank-info-row"><span className="bank-info-label">Số tài khoản</span><span className="bank-info-value">{group.account_number}</span></div>}
+                {group.account_holder && <div className="bank-info-row"><span className="bank-info-label">Chủ tài khoản</span><span className="bank-info-value">{group.account_holder}</span></div>}
+                <div className="bank-info-row"><span className="bank-info-label">Số tiền</span>
+                  <span className="bank-info-value" style={{ color: 'var(--accent-start)', fontSize: '1.1rem' }}>{formatVnd(myAmount)}đ</span></div>
+              </div>
+            )}
             <div className="card" style={{ marginBottom: 16 }}>
               <h3 className="section-title" style={{ marginBottom: 6 }}>📸 Ảnh chuyển khoản (tùy chọn)</h3>
-              <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginBottom: 12 }}>
-                Bạn có thể bấm “Done” luôn mà không cần up ảnh.
-              </p>
+              <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginBottom: 12 }}>Có thể bấm “Done” luôn mà không cần up ảnh.</p>
               <div className={`upload-area ${paymentProof ? 'has-image' : ''}`} onClick={() => document.getElementById('proof-upload').click()}>
-                {paymentProof ? (
-                  <img src={paymentProof} alt="Payment proof" className="upload-preview" />
-                ) : (
-                  <>
-                    <span className="upload-icon">📷</span>
-                    <p className="upload-text"><span>Bấm để upload</span> ảnh chuyển khoản</p>
-                    <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: 8 }}>Tối đa 2MB</p>
-                  </>
+                {paymentProof ? <img src={paymentProof} alt="proof" className="upload-preview" /> : (
+                  <><span className="upload-icon">📷</span><p className="upload-text"><span>Bấm để upload</span> ảnh</p></>
                 )}
               </div>
               <input id="proof-upload" type="file" className="upload-input" accept="image/*" onChange={handleImageUpload} />
-              {paymentProof && (
-                <button className="btn btn-secondary btn-sm btn-block" style={{ marginTop: 8 }} onClick={() => setPaymentProof('')}>
-                  🗑️ Chọn ảnh khác
-                </button>
-              )}
+              {paymentProof && <button className="btn btn-secondary btn-sm btn-block" style={{ marginTop: 8 }} onClick={() => setPaymentProof('')}>🗑️ Chọn ảnh khác</button>}
             </div>
-
-            <button className="btn btn-primary btn-block btn-lg" onClick={submitPayment} disabled={submitting} id="btn-submit-payment">
-              {submitting ? <span className="spinner"></span> : '✅ Done — Tôi đã đóng'}
+            <button className="btn btn-primary btn-block btn-lg" onClick={() => submitPayment(myShare)} disabled={submitting}>
+              {submitting ? <span className="spinner"></span> : '✅ Done · Tôi đã đóng'}
             </button>
           </>
-        ) : (
-          <div className="status-banner closed">🔴 Nhóm đã đóng, không thể báo đóng</div>
         )}
+        {myShare && myShare.status === 'submitted' && (
+          <div className="status-banner active" style={{ marginTop: 4 }}>⏳ Đã báo, chờ chủ nhóm xác nhận</div>
+        )}
+        {myShare && myShare.status === 'confirmed' && (
+          <div className="status-banner active" style={{ marginTop: 4 }}>🎉 Đã được xác nhận!</div>
+        )}
+        {myShare && myShare.status !== 'confirmed' && !canPay(bill) && (
+          <div className="status-banner closed" style={{ marginTop: 4 }}>🔴 Hoá đơn đã đóng, không thể báo</div>
+        )}
+
+        {/* Full breakdown */}
+        <div className="divider"></div>
+        <h3 className="section-title" style={{ marginBottom: 10 }}>🍽️ Chi tiết món</h3>
+        <div className="card" style={{ marginBottom: 16 }}>
+          {billItems.map(it => {
+            const sharers = sharesByItem[it.id] || []
+            return (
+              <div key={it.id} className="detail-item-row">
+                <div>
+                  <div className="detail-item-name">{it.name} {Number(it.qty) > 1 && <span className="detail-item-qty">×{Number(it.qty)}</span>}</div>
+                  <div className="detail-item-sub">{sharers.length ? sharers.map(participantName).join(', ') : 'chưa gán'}</div>
+                </div>
+                <div className="detail-item-price">{formatVnd(Number(it.price) * Number(it.qty))}đ</div>
+              </div>
+            )
+          })}
+          <div className="detail-item-row" style={{ borderTop: '1px solid var(--border-glass)' }}>
+            <div className="detail-item-name">Tổng</div>
+            <div className="detail-item-price" style={{ color: 'var(--accent-start)' }}>{formatVnd(total)}đ</div>
+          </div>
+        </div>
+        <h3 className="section-title" style={{ marginBottom: 10 }}>👥 Mọi người</h3>
+        {shares.map(s => (
+          <div key={s.id} className="member-card">
+            <div className="member-avatar">{participantName(s.participant_id).charAt(0).toUpperCase()}</div>
+            <div className="member-info">
+              <div className="member-name">{participantName(s.participant_id)}{s.participant_id === myPid && ' (bạn)'}</div>
+              <div className="member-amount">{formatVnd(owed[s.participant_id] || 0)}đ</div>
+            </div>
+            <ShareBadge share={s} />
+          </div>
+        ))}
       </div>
     )
   }
+
+  const openBill = openBillId ? bills.find(b => b.id === openBillId) : null
 
   return (
     <div className="container">
@@ -282,59 +272,73 @@ export default function GroupMember() {
       </div>
 
       <div className={`status-banner ${group.status}`}>
-        {group.status === 'planning' && '📝 Đang lên kế hoạch — chờ chủ nhóm chốt giá'}
-        {group.status === 'active' && '🟢 Bill đang mở'}
+        {group.status === 'planning' && '📝 Đang lên kế hoạch · chờ chủ nhóm tạo hoá đơn'}
+        {group.status === 'active' && '🟢 Nhóm đang mở'}
         {group.status === 'closed' && '🔴 Nhóm đã đóng'}
       </div>
 
-      {/* Tabs */}
       <div className="tabs">
         <button className={`tab ${tab === 'chat' ? 'active' : ''}`} onClick={() => setTab('chat')}>💬 Chat</button>
-        <button className={`tab ${tab === 'bill' ? 'active' : ''}`} onClick={() => setTab('bill')}>🧾 Bill</button>
+        <button className={`tab ${tab === 'bill' ? 'active' : ''}`} onClick={() => setTab('bill')}>
+          🧾 Hoá đơn{bills.length > 0 && <span className="tab-badge" style={{ background: 'var(--accent-gradient)' }}>{bills.length}</span>}
+        </button>
       </div>
 
-      {/* CHAT TAB */}
       {tab === 'chat' && <Chat groupId={groupId} senderName={myName} isOwner={false} />}
 
-      {/* BILL TAB */}
       {tab === 'bill' && (
         <div className="animate-slide-up">
-          {isPlanning ? (
-            <div className="empty-state">
-              <span className="empty-state-icon">⏳</span>
-              <p>Chủ nhóm chưa lên giá. Hãy vào <strong>Chat</strong> để cùng lên kế hoạch nhé!</p>
-            </div>
-          ) : selectedMember ? (
-            renderPayView()
-          ) : (
-            <>
-              <div className="progress-bar-wrapper">
-                <div className="progress-bar-label">
-                  <span>Tiến độ: {confirmed}/{members.length}</span>
-                  <span>{progress}%</span>
-                </div>
-                <div className="progress-bar">
-                  <div className="progress-bar-fill" style={{ width: `${progress}%` }}></div>
-                </div>
+          {/* Who am I picker */}
+          {!myPid && participants.length > 0 && (
+            <div className="card" style={{ marginBottom: 16 }}>
+              <h3 className="section-title" style={{ fontSize: '0.95rem', marginBottom: 4 }}>Bạn là ai trong nhóm?</h3>
+              <p style={{ color: 'var(--text-muted)', fontSize: '0.82rem', marginBottom: 12 }}>Chọn tên của bạn để xem phần mình cần đóng.</p>
+              <div className="roster-chips">
+                {participants.map(p => (
+                  <button key={p.id} className="assign-chip" onClick={() => pickParticipant(p.id)}>{p.name}</button>
+                ))}
               </div>
+            </div>
+          )}
+          {myPid && (
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginBottom: 12 }}>
+              Bạn là <strong style={{ color: 'var(--text-secondary)' }}>{participantName(myPid)}</strong> ·{' '}
+              <button className="link-btn" onClick={() => { setParticipantId(groupId, ''); setMyPid('') }}>đổi</button>
+            </p>
+          )}
 
-              <h3 className="section-title" style={{ margin: '16px 0' }}>👤 Chọn tên của bạn để đóng tiền</h3>
-
-              {members.map((member) => (
-                <div
-                  key={member.id}
-                  className={`member-select-card ${member.status === 'confirmed' ? 'disabled' : ''}`}
-                  onClick={() => selectMember(member)}
-                >
-                  <div className="member-avatar">{member.name.charAt(0).toUpperCase()}</div>
-                  <div className="member-info">
-                    <div className="member-name">{member.name}</div>
-                    <div className="member-amount">{formatNumber(member.amount)} VNĐ</div>
+          {openBill ? renderBillDetail(openBill) : (
+            bills.length === 0 ? (
+              <div className="empty-state">
+                <span className="empty-state-icon">⏳</span>
+                <p>Chưa có hoá đơn nào. Vào <strong>Chat</strong> để cùng lên kế hoạch nhé!</p>
+              </div>
+            ) : (
+              bills.map(bill => {
+                const { total } = computeFor(bill.id)
+                const myShare = myShareFor(bill.id)
+                const myAmount = myPid ? computeFor(bill.id).owed[myPid] || 0 : 0
+                return (
+                  <div key={bill.id} className="bill-list-card" onClick={() => { setOpenBillId(bill.id); setPaymentProof('') }}>
+                    <div className="bill-list-top">
+                      <div className="bill-list-title">{bill.title}</div>
+                      <div className="bill-list-total">{formatVnd(total)}đ</div>
+                    </div>
+                    <div className="bill-meta">
+                      {bill.bill_date && <span>📅 {new Date(`${bill.bill_date}T00:00:00`).toLocaleDateString('vi-VN')}</span>}
+                      <DueBadge dueDate={bill.due_date} settled={myShare?.status === 'confirmed'} />
+                      {bill.status === 'closed' && <span className="badge badge-cash">🔒</span>}
+                    </div>
+                    {myPid && myShare && (
+                      <div className="bill-list-myrow">
+                        <span>Bạn: <strong style={{ color: 'var(--accent-start)' }}>{formatVnd(myAmount)}đ</strong></span>
+                        <ShareBadge share={myShare} />
+                      </div>
+                    )}
                   </div>
-                  {getStatusBadge(member)}
-                </div>
-              ))}
-            </>
+                )
+              })
+            )
           )}
         </div>
       )}

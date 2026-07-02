@@ -37,7 +37,8 @@ npm install
 3. Vào **SQL Editor** → bấm **New Query**
 4. Copy toàn bộ nội dung file `supabase-setup.sql` → paste vào → bấm **Run**
    - Nếu bạn **đã tạo schema cũ** từ trước, chạy `supabase-migration.sql` thay vì setup (an toàn khi chạy nhiều lần).
-5. Kiểm tra tab **Table Editor** → phải thấy 3 bảng: `groups`, `members`, `messages`
+5. Chạy thêm `supabase-bills.sql` (New Query → paste → Run) để thêm tính năng **hoá đơn chi tiết** (nhiều hoá đơn / ngày / hạn trả / gán món theo người). An toàn khi chạy nhiều lần.
+6. Kiểm tra tab **Table Editor** → phải thấy các bảng: `groups`, `members`, `messages`, `participants`, `bills`, `bill_items`, `item_shares`, `bill_shares`
 
 ### Bước 3: Lấy Supabase credentials
 
@@ -112,6 +113,7 @@ LenKeo/
 ├── vite.config.js
 ├── supabase-setup.sql      # SQL tạo database (project mới)
 ├── supabase-migration.sql  # SQL migrate database cũ
+├── supabase-bills.sql      # SQL thêm hoá đơn chi tiết (chạy sau setup)
 ├── .env.example             # File mẫu biến môi trường
 ├── public/
 │   └── vite.svg             # Favicon
